@@ -1,0 +1,27 @@
+{
+  "name": "@delego/web",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Delego consumer web application",
+  "scripts": {
+    "dev": "next dev -p ${WEB_PORT:-3001}",
+    "build": "next build",
+    "start": "next start -p ${WEB_PORT:-3001}",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'TODO: add eslint'"
+  },
+  "dependencies": {
+    "@delego/sdk": "workspace:*",
+    "@delego/types": "workspace:*",
+    "@delego/ui": "workspace:*",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}
