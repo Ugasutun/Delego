@@ -230,6 +230,20 @@ async function executeTxJob(
       if (txStatus.status === rpc.Api.GetTransactionStatus.SUCCESS) {
         const successTx = txStatus as rpc.Api.GetSuccessfulTransactionResponse;
         log.info("Transaction completed successfully", { txHash });
+
+        // Record spend in Redis after successful confirmation
+        if (request.userId && request.walletId && request.amountStroops) {
+          try {
+            const { recordSpend } = await import("../spendLimits.js");
+            const amount = BigInt(request.amountStroops);
+            if (amount > 0n) {
+              await recordSpend(request.userId, request.walletId, amount);
+            }
+          } catch (err: any) {
+            log.error("Failed to record spend in Redis", { error: err.message });
+          }
+        }
+
         return {
           hash: txHash,
           ledger: successTx.ledger,
@@ -365,6 +379,46 @@ export function initQueue() {
 }
 
 export async function addTransactionToQueue(request: TransactionRequest): Promise<TransactionResult> {
+  // Check spend limit first
+  let userId = request.userId;
+  let walletId = request.walletId;
+  const delegationId = request.delegationId ?? null;
+  const amountStroops = request.amountStroops ? BigInt(request.amountStroops) : 0n;
+
+  if (!userId || !walletId) {
+    try {
+      const { Wallet } = await import("../models/Wallet.js");
+      const wallet = await Wallet.findOne({
+        where: { stellarAddress: request.sourceAddress }
+      });
+      if (wallet) {
+        userId = userId || wallet.userId;
+        walletId = walletId || wallet.id;
+      }
+    } catch (err: any) {
+      log.warn("Could not load wallet from DB for limit check, continuing without limit checks", { error: err.message });
+    }
+  }
+
+  if (userId && walletId) {
+    try {
+      const { checkSpendLimit } = await import("../spendLimits.js");
+      const checkResult = await checkSpendLimit(userId, walletId, delegationId, amountStroops);
+      if (!checkResult.allowed) {
+        throw new Error(`Spending limit exceeded: ${checkResult.reason || "limit exceeded"}`);
+      }
+      request.userId = userId;
+      request.walletId = walletId;
+      request.delegationId = delegationId;
+      request.amountStroops = amountStroops.toString();
+    } catch (err: any) {
+      if (err.message.includes("Spending limit exceeded")) {
+        throw err;
+      }
+      log.warn("Could not check spend limit due to DB error, continuing", { error: err.message });
+    }
+  }
+
   const isTest = process.env.NODE_ENV === "test";
   const connection = getRedisConnection();
 
