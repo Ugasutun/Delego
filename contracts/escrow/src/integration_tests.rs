@@ -456,3 +456,208 @@ fn test_escrow_events() {
     assert!(resolved_event_found);
 }
 
+#[test]
+fn test_two_step_admin_transfer() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let new_admin = Address::generate(&t.env);
+
+    // Initially, new_admin is not admin
+    assert!(!escrow_client.is_admin(&new_admin));
+    assert!(escrow_client.is_admin(&t.admin));
+
+    // Propose new admin
+    assert!(escrow_client.propose_admin(&t.admin, &new_admin));
+
+    // Accept new admin
+    assert!(escrow_client.accept_admin(&new_admin));
+
+    // Verify new roles
+    assert!(escrow_client.is_admin(&new_admin));
+    assert!(!escrow_client.is_admin(&t.admin));
+}
+
+#[test]
+fn test_old_admin_loses_privileges() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let new_admin = Address::generate(&t.env);
+
+    // Propose and accept transfer
+    assert!(escrow_client.propose_admin(&t.admin, &new_admin));
+    assert!(escrow_client.accept_admin(&new_admin));
+
+    // Try to propose another admin as the old admin -> should fail
+    let another = Address::generate(&t.env);
+    let res = escrow_client.try_propose_admin(&t.admin, &another);
+    assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_accept_admin_wrong_address() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let new_admin = Address::generate(&t.env);
+    let wrong_admin = Address::generate(&t.env);
+
+    // Accept when no pending transfer exists -> NoPendingTransfer
+    let res = escrow_client.try_accept_admin(&new_admin);
+    assert_eq!(res, Err(Ok(EscrowError::NoPendingTransfer)));
+
+    // Propose new admin
+    assert!(escrow_client.propose_admin(&t.admin, &new_admin));
+
+    // Try to accept as wrong address -> InvalidPendingAdmin
+    let res2 = escrow_client.try_accept_admin(&wrong_admin);
+    assert_eq!(res2, Err(Ok(EscrowError::InvalidPendingAdmin)));
+}
+
+#[test]
+fn test_cancel_admin_transfer() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let new_admin = Address::generate(&t.env);
+
+    // Cancel when no pending transfer exists -> NoPendingTransfer
+    let res = escrow_client.try_cancel_admin_transfer(&t.admin);
+    assert_eq!(res, Err(Ok(EscrowError::NoPendingTransfer)));
+
+    // Propose
+    assert!(escrow_client.propose_admin(&t.admin, &new_admin));
+
+    // Cancel
+    assert!(escrow_client.cancel_admin_transfer(&t.admin));
+
+    // Accept should now fail with NoPendingTransfer
+    let res2 = escrow_client.try_accept_admin(&new_admin);
+    assert_eq!(res2, Err(Ok(EscrowError::NoPendingTransfer)));
+}
+
+#[test]
+fn test_co_admin_dispute_resolution() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let co_admin = Address::generate(&t.env);
+
+    // Add co-admin
+    assert!(escrow_client.add_co_admin(&t.admin, &co_admin));
+    assert!(escrow_client.is_admin(&co_admin));
+
+    // Try to add the same co-admin again -> AdminAlreadyExists
+    let res = escrow_client.try_add_co_admin(&t.admin, &co_admin);
+    assert_eq!(res, Err(Ok(EscrowError::AdminAlreadyExists)));
+
+    // Try to add primary admin as co-admin -> AdminAlreadyExists
+    let res2 = escrow_client.try_add_co_admin(&t.admin, &t.admin);
+    assert_eq!(res2, Err(Ok(EscrowError::AdminAlreadyExists)));
+
+    // Setup escrow and dispute
+    let amount = 1000i128;
+    let timeout = 3600u64;
+    let escrow_id = escrow_client.create_escrow(
+        &t.buyer,
+        &t.buyer,
+        &t.permissions_contract_id,
+        &t.seller,
+        &t.token_contract_id,
+        &amount,
+        &timeout,
+    );
+    assert!(escrow_client.dispute(&escrow_id, &t.buyer));
+
+    // Resolve dispute as co_admin
+    assert!(escrow_client.resolve_dispute(&escrow_id, &co_admin, &true));
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert!(matches!(record.status, EscrowStatus::Released));
+}
+
+#[test]
+fn test_co_admin_restrictions() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let co_admin = Address::generate(&t.env);
+    let another = Address::generate(&t.env);
+
+    assert!(escrow_client.add_co_admin(&t.admin, &co_admin));
+
+    // Co-admin tries to propose admin -> Unauthorized
+    let res = escrow_client.try_propose_admin(&co_admin, &another);
+    assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
+
+    // Co-admin tries to cancel admin transfer -> Unauthorized
+    let res2 = escrow_client.try_cancel_admin_transfer(&co_admin);
+    assert_eq!(res2, Err(Ok(EscrowError::Unauthorized)));
+
+    // Co-admin tries to add another co-admin -> Unauthorized
+    let res3 = escrow_client.try_add_co_admin(&co_admin, &another);
+    assert_eq!(res3, Err(Ok(EscrowError::Unauthorized)));
+
+    // Co-admin tries to remove co-admin -> Unauthorized
+    let res4 = escrow_client.try_remove_co_admin(&co_admin, &co_admin);
+    assert_eq!(res4, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_remove_co_admin() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let co_admin = Address::generate(&t.env);
+
+    // Remove non-existent co-admin -> NotFound
+    let res = escrow_client.try_remove_co_admin(&t.admin, &co_admin);
+    assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+
+    // Add co-admin
+    assert!(escrow_client.add_co_admin(&t.admin, &co_admin));
+    assert!(escrow_client.is_admin(&co_admin));
+
+    // Remove co-admin
+    assert!(escrow_client.remove_co_admin(&t.admin, &co_admin));
+    assert!(!escrow_client.is_admin(&co_admin));
+
+    // Setup escrow and dispute
+    let amount = 1000i128;
+    let timeout = 3600u64;
+    let escrow_id = escrow_client.create_escrow(
+        &t.buyer,
+        &t.buyer,
+        &t.permissions_contract_id,
+        &t.seller,
+        &t.token_contract_id,
+        &amount,
+        &timeout,
+    );
+    assert!(escrow_client.dispute(&escrow_id, &t.buyer));
+
+    // Try to resolve dispute as revoked co-admin -> Unauthorized
+    let res2 = escrow_client.try_resolve_dispute(&escrow_id, &co_admin, &true);
+    assert_eq!(res2, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_co_admin_accepts_primary_admin() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let co_admin = Address::generate(&t.env);
+
+    // 1. Add co-admin
+    assert!(escrow_client.add_co_admin(&t.admin, &co_admin));
+    assert!(escrow_client.is_admin(&co_admin));
+
+    // 2. Propose the co-admin as the new primary admin
+    assert!(escrow_client.propose_admin(&t.admin, &co_admin));
+
+    // 3. Co-admin accepts role -> should be removed from co-admins list
+    assert!(escrow_client.accept_admin(&co_admin));
+    assert!(escrow_client.is_admin(&co_admin));
+
+    // 4. Now, the new primary admin (co_admin) proposes the old admin
+    assert!(escrow_client.propose_admin(&co_admin, &t.admin));
+    assert!(escrow_client.accept_admin(&t.admin));
+
+    // 5. Old co-admin (who accepted primary admin earlier, and was then replaced) should no longer be admin!
+    assert!(!escrow_client.is_admin(&co_admin));
+}
+
+
+

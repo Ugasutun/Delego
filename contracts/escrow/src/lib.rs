@@ -76,6 +76,8 @@ pub enum DataKey {
     Admin,
     Escrow(u64),
     LastEscrowId,
+    PendingAdmin,
+    AdminList,
 }
 
 #[contracterror]
@@ -100,6 +102,12 @@ pub enum EscrowError {
     NotDisputed = 8,
     /// Invalid amount (zero or negative)
     InvalidAmount = 9,
+    /// No pending admin transfer exists
+    NoPendingTransfer = 13,
+    /// Caller is not the pending admin
+    InvalidPendingAdmin = 14,
+    /// Admin already exists
+    AdminAlreadyExists = 15,
 }
 
 #[contract]
@@ -191,14 +199,13 @@ impl EscrowContract {
     pub fn release(env: Env, escrow_id: u64, caller: Address) -> Result<bool, EscrowError> {
         caller.require_auth();
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
             Some(rec) => rec,
             None => return Err(EscrowError::NotFound),
         };
 
-        if caller != record.buyer && caller != admin {
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -236,7 +243,6 @@ impl EscrowContract {
     pub fn refund(env: Env, escrow_id: u64, caller: Address) -> Result<bool, EscrowError> {
         caller.require_auth();
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
             Some(rec) => rec,
@@ -251,7 +257,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidStatus);
         }
 
-        if caller == record.seller || caller == admin {
+        if caller == record.seller || Self::is_admin(env.clone(), caller.clone()) {
             // Authorized at any time
         } else if caller == record.buyer {
             // Buyer can refund only if timeout has passed
@@ -318,8 +324,7 @@ impl EscrowContract {
     pub fn resolve_dispute(env: Env, escrow_id: u64, caller: Address, release_to_seller: bool) -> Result<bool, EscrowError> {
         caller.require_auth();
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != admin {
+        if !Self::is_admin(env.clone(), caller.clone()) {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -360,6 +365,118 @@ impl EscrowContract {
     pub fn get_escrow(env: Env, escrow_id: u64) -> EscrowRecord {
         let key = DataKey::Escrow(escrow_id);
         env.storage().persistent().get(&key).expect("Escrow not found")
+    }
+
+    /// Propose a new primary admin. Must be called by current primary admin.
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<bool, EscrowError> {
+        current_admin.require_auth();
+        let primary_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(EscrowError::NotFound)?;
+        if current_admin != primary_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        Ok(true)
+    }
+
+    /// Accept the primary admin role. Must be called by the proposed new admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<bool, EscrowError> {
+        new_admin.require_auth();
+        let pending_admin: Address = match env.storage().instance().get(&DataKey::PendingAdmin) {
+            Some(addr) => addr,
+            None => return Err(EscrowError::NoPendingTransfer),
+        };
+        if new_admin != pending_admin {
+            return Err(EscrowError::InvalidPendingAdmin);
+        }
+
+        let mut admin_list: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if let Some(index) = admin_list.first_index_of(&new_admin) {
+            admin_list.remove(index);
+            env.storage().instance().set(&DataKey::AdminList, &admin_list);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(true)
+    }
+
+    /// Cancel a pending admin transfer. Must be called by current primary admin.
+    pub fn cancel_admin_transfer(env: Env, current_admin: Address) -> Result<bool, EscrowError> {
+        current_admin.require_auth();
+        let primary_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(EscrowError::NotFound)?;
+        if current_admin != primary_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            return Err(EscrowError::NoPendingTransfer);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(true)
+    }
+
+    /// Add a co-admin. Must be called by the primary admin.
+    pub fn add_co_admin(env: Env, admin: Address, new_co_admin: Address) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        let primary_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(EscrowError::NotFound)?;
+        if admin != primary_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+        if new_co_admin == primary_admin {
+            return Err(EscrowError::AdminAlreadyExists);
+        }
+        let mut admin_list: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if admin_list.contains(&new_co_admin) {
+            return Err(EscrowError::AdminAlreadyExists);
+        }
+        admin_list.push_back(new_co_admin);
+        env.storage().instance().set(&DataKey::AdminList, &admin_list);
+        Ok(true)
+    }
+
+    /// Remove a co-admin. Must be called by the primary admin.
+    pub fn remove_co_admin(env: Env, admin: Address, co_admin: Address) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        let primary_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(EscrowError::NotFound)?;
+        if admin != primary_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+        let mut admin_list: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let index = match admin_list.first_index_of(&co_admin) {
+            Some(idx) => idx,
+            None => return Err(EscrowError::NotFound),
+        };
+        admin_list.remove(index);
+        env.storage().instance().set(&DataKey::AdminList, &admin_list);
+        Ok(true)
+    }
+
+    /// Returns true if the address is the primary admin or a co-admin.
+    pub fn is_admin(env: Env, address: Address) -> bool {
+        let primary_admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(addr) => addr,
+            None => return false,
+        };
+        if address == primary_admin {
+            return true;
+        }
+        let admin_list: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        admin_list.contains(&address)
     }
 }
 
