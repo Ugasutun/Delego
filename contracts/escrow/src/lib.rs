@@ -1,4 +1,4 @@
-//! Delego Escrow Contract
+﻿//! Delego Escrow Contract
 //!
 //! Holds funds in escrow until order fulfillment is confirmed.
 
