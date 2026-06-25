@@ -10,7 +10,7 @@ export function useDelegations() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.getDelegations().then((res: any) => {
+    api.getDelegations().then((res) => {
       if (res.data) setDelegations(res.data);
       setLoading(false);
     });
