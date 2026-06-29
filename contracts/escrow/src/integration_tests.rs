@@ -1,10 +1,10 @@
 #![cfg(test)]
 
+use crate::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     Address, BytesN, Env, IntoVal,
 };
-use crate::{EscrowContract, EscrowContractClient, EscrowError, EscrowStatus};
 
 struct TestEnv {
     env: Env,
@@ -28,7 +28,9 @@ impl TestEnv {
         let treasury = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_contract_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_contract_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_admin_client =
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
@@ -88,7 +90,10 @@ fn test_deposit_with_non_whitelisted_token_fails() {
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
     let other_token_admin = Address::generate(&t.env);
-    let other_token_contract_id = t.env.register_stellar_asset_contract(other_token_admin.clone());
+    let other_token_contract_id = t
+        .env
+        .register_stellar_asset_contract_v2(other_token_admin.clone())
+        .address();
 
     assert_eq!(
         escrow_client.try_deposit(
@@ -319,9 +324,7 @@ fn test_timeout_auto_refund() {
     let escrow_id = deposit_escrow(&t, 1000, timeout_ledgers);
 
     let record = escrow_client.get_escrow(&escrow_id);
-    t.env
-        .ledger()
-        .set_sequence_number(record.timeout_ledger);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
 
     assert!(escrow_client.refund(&escrow_id, &t.buyer));
     assert_eq!(token_client.balance(&t.buyer), 10000);
@@ -379,4 +382,259 @@ fn test_get_escrow_returns_full_record() {
     assert_eq!(record.status, EscrowStatus::Funded);
     assert_eq!(record.order_id, t.order_id());
     assert!(record.timeout_ledger > t.env.ledger().sequence());
+}
+
+// ── Issue #173: RefundEligibility getter tests ──────────────────────────
+
+#[test]
+fn test_refund_eligibility_seller_always_eligible() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let re = client.get_refund_eligibility(&eid, &t.seller);
+    assert_eq!(re.escrow_id, eid);
+    assert!(re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("ok"));
+}
+
+#[test]
+fn test_refund_eligibility_admin_always_eligible() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let re = client.get_refund_eligibility(&eid, &t.admin);
+    assert!(re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("ok"));
+}
+
+#[test]
+fn test_refund_eligibility_buyer_before_timeout() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let re = client.get_refund_eligibility(&eid, &t.buyer);
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("timeout"));
+}
+
+#[test]
+fn test_refund_eligibility_buyer_after_timeout() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let record = client.get_escrow(&eid);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
+
+    let re = client.get_refund_eligibility(&eid, &t.buyer);
+    assert!(re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("ok"));
+}
+
+#[test]
+fn test_refund_eligibility_not_found() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let re = client.get_refund_eligibility(&999, &t.buyer);
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("notfund"));
+}
+
+#[test]
+fn test_refund_eligibility_already_released() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.release(&eid, &t.buyer);
+
+    let re = client.get_refund_eligibility(&eid, &t.seller);
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("released"));
+}
+
+#[test]
+fn test_refund_eligibility_already_refunded() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.refund(&eid, &t.seller);
+
+    let re = client.get_refund_eligibility(&eid, &t.buyer);
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("refunded"));
+}
+
+#[test]
+fn test_refund_eligibility_disputed() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.dispute(&eid, &t.buyer);
+
+    let re = client.get_refund_eligibility(&eid, &t.seller);
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("disputed"));
+}
+
+#[test]
+fn test_refund_eligibility_unauthorized_stranger() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let re = client.get_refund_eligibility(&eid, &t.agent);
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("noauth"));
+}
+
+// ── ReleaseEligibility getter tests ──────────────────────────────────────
+
+#[test]
+fn test_release_eligibility_funded_before_timeout() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let re = client.get_release_eligibility(&eid);
+    assert_eq!(re.escrow_id, t.order_id());
+    assert!(re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("ok"));
+}
+
+#[test]
+fn test_release_eligibility_disputed_blocks_release() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.dispute(&eid, &t.buyer);
+
+    let re = client.get_release_eligibility(&eid);
+    assert_eq!(re.escrow_id, t.order_id());
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("disputed"));
+}
+
+#[test]
+fn test_release_eligibility_timeout_blocks_release() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+
+    let record = client.get_escrow(&eid);
+    t.env.ledger().set_sequence_number(record.timeout_ledger);
+
+    let re = client.get_release_eligibility(&eid);
+    assert_eq!(re.escrow_id, t.order_id());
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("timeout"));
+}
+
+#[test]
+fn test_release_eligibility_terminal_release_blocks_release() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.release(&eid, &t.buyer);
+
+    let re = client.get_release_eligibility(&eid);
+    assert_eq!(re.escrow_id, t.order_id());
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("released"));
+}
+
+#[test]
+fn test_release_eligibility_terminal_refund_blocks_release() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.refund(&eid, &t.seller);
+
+    let re = client.get_release_eligibility(&eid);
+    assert_eq!(re.escrow_id, t.order_id());
+    assert!(!re.eligible);
+    assert_eq!(re.reason, soroban_sdk::symbol_short!("refunded"));
+}
+
+// ── EscrowReceipt getter tests (get_receipt) ─────────────────────────────
+
+/// Success path: receipt returned immediately after deposit (Funded state).
+#[test]
+fn test_get_receipt_funded_state() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let eid = deposit_escrow(&t, 1000, 100);
+    let receipt = client.get_receipt(&eid);
+
+    assert_eq!(receipt.escrow_id, eid);
+    assert_eq!(receipt.buyer, t.buyer);
+    assert_eq!(receipt.seller, t.seller);
+    assert_eq!(receipt.order_id, t.order_id());
+    assert_eq!(receipt.status, EscrowStatus::Funded);
+}
+
+/// Success path: receipt reflects Released status after release.
+#[test]
+fn test_get_receipt_released_state() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.release(&eid, &t.buyer);
+
+    let receipt = client.get_receipt(&eid);
+    assert_eq!(receipt.escrow_id, eid);
+    assert_eq!(receipt.status, EscrowStatus::Released);
+    // Buyer and seller are unchanged after release
+    assert_eq!(receipt.buyer, t.buyer);
+    assert_eq!(receipt.seller, t.seller);
+    assert_eq!(receipt.order_id, t.order_id());
+}
+
+/// Success path: receipt reflects Refunded status after refund.
+#[test]
+fn test_get_receipt_refunded_state() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.refund(&eid, &t.seller);
+
+    let receipt = client.get_receipt(&eid);
+    assert_eq!(receipt.escrow_id, eid);
+    assert_eq!(receipt.status, EscrowStatus::Refunded);
+    assert_eq!(receipt.buyer, t.buyer);
+    assert_eq!(receipt.seller, t.seller);
+    assert_eq!(receipt.order_id, t.order_id());
+}
+
+/// Success path: receipt reflects Disputed status mid-lifecycle.
+#[test]
+fn test_get_receipt_disputed_state() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let eid = deposit_escrow(&t, 1000, 100);
+    client.dispute(&eid, &t.buyer);
+
+    let receipt = client.get_receipt(&eid);
+    assert_eq!(receipt.escrow_id, eid);
+    assert_eq!(receipt.status, EscrowStatus::Disputed);
+    assert_eq!(receipt.buyer, t.buyer);
+    assert_eq!(receipt.seller, t.seller);
+    assert_eq!(receipt.order_id, t.order_id());
+}
+
+/// Failure path: NotFound error for a non-existent escrow id.
+#[test]
+fn test_get_receipt_not_found() {
+    let t = TestEnv::setup();
+    let client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let result = client.try_get_receipt(&999u64);
+    assert_eq!(result, Err(Ok(EscrowError::NotFound)));
 }
